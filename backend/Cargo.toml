@@ -1,0 +1,19 @@
+[package]
+name = "backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+actix-web = "4.0"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+dotenv = "0.15"
+sled = "0.34"
+serde_json = "1.0.128"
+log = "0.4.22"
+env_logger = "0.11.5"
+itertools = "0.13.0"
+
+[dev-dependencies]
+actix-rt = "2"        # This is required for running async tests
+backend = { path = "../backend" }
