@@ -1,0 +1,23 @@
+# Rust specific
+target/
+**/*.rs.bk
+
+# Sled database files
+my_db
+test_db
+
+# IDE specific
+.idea/
+.vscode/
+*.iml
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+
+# Elm specific
+elm-stuff/
+*.elm.js
