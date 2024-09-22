@@ -3,15 +3,14 @@ use chrono::{Datelike, Duration, NaiveDate, Utc};
 use dotenv::dotenv;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use serde_json::from_str;
-use sled::Db;
+use sqlx::FromRow;
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
-use std::str::from_utf8;
-use std::sync::Arc;
 
 // Data models
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, FromRow)]
 struct Session {
+    id: i64,
     date: String,         // Format: "YYYY-MM-DD"
     session_type: String, // "1-hour", "2-hours", "3-hours"
 }
@@ -21,6 +20,7 @@ struct TimeResponse {
     current_time: String,
     streak: usize,
     total_points: usize,
+    date: String,
 }
 
 #[derive(Serialize)]
@@ -47,6 +47,7 @@ struct StreaksResponse {
     yearly_streak: usize,
     monthly_streak: usize,
 }
+
 #[derive(Serialize, Deserialize)]
 struct StreakBonusResponse {
     streak_length: usize,
@@ -74,6 +75,7 @@ struct StatisticsResponse {
 pub enum ApiError {
     InvalidInput(String),
     DatabaseError(String),
+    SerializationError(String),
 }
 
 impl Display for ApiError {
@@ -81,6 +83,7 @@ impl Display for ApiError {
         match self {
             ApiError::InvalidInput(message) => write!(f, "Invalid input: {}", message),
             ApiError::DatabaseError(message) => write!(f, "Database error: {}", message),
+            ApiError::SerializationError(message) => write!(f, "Serialization error: {}", message),
         }
     }
 }
@@ -97,30 +100,46 @@ impl actix_web::error::ResponseError for ApiError {
                     error: message.clone(),
                 })
             }
+            ApiError::SerializationError(message) => {
+                HttpResponse::InternalServerError().json(ErrorResponse {
+                    error: message.clone(),
+                })
+            }
         }
     }
 }
 
 // Fetch the current time and calculate streaks
-pub async fn get_time(db: web::Data<Arc<Db>>) -> Result<impl Responder, ApiError> {
-    let time = Utc::now();
-    let time_str = time.to_rfc3339(); // ISO 8601 format
+pub async fn get_time(
+    pool: web::Data<sqlx::SqlitePool>,
+    query: web::Query<HashMap<String, String>>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let current_time = if let Some(date_str) = query.get("date") {
+        NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+            .map_err(|_| actix_web::error::ErrorBadRequest("Invalid date format"))?
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| actix_web::error::ErrorBadRequest("Invalid time components"))?
+    } else {
+        Utc::now().naive_utc()
+    };
 
-    db.insert(b"last_time", time_str.as_bytes())
-        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
-
-    let (sessions, _, total_points) = fetch_sessions(&db)?;
-    let (streak, _) = calculate_streak_and_points(&sessions)?;
+    // Fetch sessions to calculate streak and total points
+    let (sessions, _, total_points) = fetch_sessions(&pool)
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+    let (streak, _) = calculate_streak_and_points(&sessions)
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
 
     Ok(HttpResponse::Ok().json(TimeResponse {
-        current_time: time_str,
+        current_time: current_time.to_string(),
         streak,
         total_points,
+        date: current_time.date().to_string(),
     }))
 }
 
 async fn create_session(
-    db: web::Data<Arc<Db>>,
+    pool: web::Data<sqlx::SqlitePool>,
     session_log: web::Json<SessionLog>,
 ) -> Result<impl Responder, ApiError> {
     let date = parse_date(&session_log.date)?;
@@ -129,54 +148,41 @@ async fn create_session(
         return Err(ApiError::InvalidInput("Invalid session type".into()));
     }
 
-    let session = Session {
-        date: date.to_string(),
-        session_type: session_log.session_type.clone(),
-    };
-
-    let session_str =
-        serde_json::to_string(&session).map_err(|e| ApiError::DatabaseError(e.to_string()))?;
-    db.insert(session.date.as_bytes(), session_str.as_bytes())
+    // Insert session into the database
+    sqlx::query("INSERT INTO session (date, session_type) VALUES (?, ?)")
+        .bind(&session_log.date)
+        .bind(&session_log.session_type)
+        .execute(pool.get_ref())
+        .await
         .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
 
-    let (sessions, _, total_points) = fetch_sessions(&db)?;
+    let (sessions, _, total_points) = fetch_sessions(pool.get_ref()).await?;
     let (streak, _) = calculate_streak_and_points(&sessions)?;
 
     Ok(HttpResponse::Created().json(TimeResponse {
-        current_time: session.date,
+        current_time: session_log.date.clone(),
         streak,
         total_points,
+        date: date.to_string(), // Use the parsed date
     }))
 }
 
 // Fetch sessions stored in the database
-fn fetch_sessions(
-    db: &web::Data<Arc<Db>>,
-) -> std::result::Result<(Vec<Session>, String, usize), ApiError> {
-    let sessions: Vec<Session> = db
-        .iter()
-        .map(|result| {
-            result
-                .map_err(|e| ApiError::DatabaseError(e.to_string()))
-                .and_then(|(_key, value)| {
-                    from_utf8(&value)
-                        .map_err(|e| ApiError::DatabaseError(e.to_string()))
-                        .and_then(|session_str| {
-                            from_str(session_str)
-                                .map_err(|e| ApiError::DatabaseError(e.to_string()))
-                        })
-                })
-        })
-        .collect::<Result<_, _>>()?;
+async fn fetch_sessions(
+    pool: &sqlx::SqlitePool,
+) -> Result<(Vec<Session>, String, usize), ApiError> {
+    let sessions: Vec<Session> =
+        sqlx::query_as::<_, Session>("SELECT * FROM session ORDER BY date")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
 
-    // Calculate current date from the last session
     let current_date = if let Some(last_session) = sessions.last() {
         last_session.date.clone()
     } else {
-        Utc::now().date_naive().to_string() // Using Utc::now().date_naive() instead of Utc::today()
+        Utc::now().date_naive().to_string()
     };
 
-    // Calculate total points
     let total_points: usize = sessions
         .iter()
         .map(|s| calculate_session_points(&s.session_type))
@@ -207,15 +213,13 @@ fn update_streak(last_date: Option<NaiveDate>, current_date: NaiveDate, streak: 
 }
 
 fn calculate_streak_and_points(sessions: &[Session]) -> Result<(usize, usize), ApiError> {
-    use itertools::Itertools;
-
     // Fold function to calculate streak and points
     let fold_fn = |(streak, total_points, last_date): (usize, usize, Option<NaiveDate>),
-                   session: Session|
+                   session: &Session|
                    -> Result<(usize, usize, Option<NaiveDate>), ApiError> {
         let current_date = parse_date(&session.date)?;
         let session_points = calculate_session_points(&session.session_type);
-        let new_streak = update_streak(last_date, current_date, streak); // Pass current streak to function
+        let new_streak = update_streak(last_date, current_date, streak);
 
         Ok((
             new_streak,
@@ -226,7 +230,6 @@ fn calculate_streak_and_points(sessions: &[Session]) -> Result<(usize, usize), A
 
     sessions
         .iter()
-        .cloned()
         .sorted_by(|a, b| a.date.cmp(&b.date)) // Sort sessions by date
         .try_fold((0, 0, None), fold_fn) // Fold with error handling
         .map(|(streak, total_points, _)| (streak, total_points)) // Ignore last_date in the result
@@ -281,7 +284,10 @@ where
 
 type StatisticsResult = (Vec<WeeklyActivity>, Vec<String>, usize, usize, usize);
 
-fn calculate_statistics(sessions: &[Session]) -> Result<StatisticsResult, ApiError> {
+fn calculate_statistics(
+    sessions: &[Session],
+    current_date: NaiveDate,
+) -> std::result::Result<StatisticsResult, ApiError> {
     let weekly_trend: Vec<WeeklyActivity> = calculate_trend(sessions, "week");
 
     // Calculate overall streak directly
@@ -295,11 +301,11 @@ fn calculate_statistics(sessions: &[Session]) -> Result<StatisticsResult, ApiErr
     };
 
     // Calculate yearly streak
-    let current_year = Utc::now().date_naive().year();
+    let current_year = current_date.year();
     let yearly_streak = calculate_period_streak(sessions, |date| date.year() == current_year);
 
     // Calculate monthly streak using the utility function
-    let current_month = Utc::now().date_naive().month();
+    let current_month = current_date.month();
     let monthly_streak = calculate_period_streak(sessions, |date| date.month() == current_month);
 
     Ok((
@@ -312,35 +318,24 @@ fn calculate_statistics(sessions: &[Session]) -> Result<StatisticsResult, ApiErr
 }
 
 // Additional endpoint implementations
-async fn get_weekly_trend(db: web::Data<Arc<Db>>) -> Result<impl Responder, ApiError> {
-    let (sessions, _current_date, _total_points) = fetch_sessions(&db)?;
-    let weekly_trend = calculate_trend(&sessions, "week");
+async fn get_weekly_trend(pool: web::Data<sqlx::SqlitePool>) -> Result<impl Responder, ApiError> {
+    let (sessions, _current_date, _total_points) = fetch_sessions(&pool).await?;
+    let (weekly_trend, _, _, _, _) = calculate_statistics(&sessions, Default::default())?;
 
     Ok(HttpResponse::Ok().json(weekly_trend))
 }
 
-async fn get_achievements(db: web::Data<Arc<Db>>) -> Result<impl Responder, ApiError> {
-    let (sessions, _current_date, _total_points) = fetch_sessions(&db)?;
-    let (overall_streak, _) = calculate_streak_and_points(&sessions)?;
-
-    let achievements = if overall_streak >= 7 {
-        vec!["7-day streak".to_string()]
-    } else {
-        vec![]
-    };
+async fn get_achievements(pool: web::Data<sqlx::SqlitePool>) -> Result<impl Responder, ApiError> {
+    let (sessions, _current_date, _total_points) = fetch_sessions(&pool).await?;
+    let (_, achievements, _, _, _) = calculate_statistics(&sessions, Default::default())?;
 
     Ok(HttpResponse::Ok().json(AchievementsResponse { achievements }))
 }
 
-async fn get_streaks(db: web::Data<Arc<Db>>) -> Result<impl Responder, ApiError> {
-    let (sessions, _current_date, _total_points) = fetch_sessions(&db)?;
-    let (overall_streak, _) = calculate_streak_and_points(&sessions)?;
-
-    let current_year = Utc::now().date_naive().year();
-    let yearly_streak = calculate_period_streak(&sessions, |date| date.year() == current_year);
-
-    let current_month = Utc::now().date_naive().month();
-    let monthly_streak = calculate_period_streak(&sessions, |date| date.month() == current_month);
+async fn get_streaks(pool: web::Data<sqlx::SqlitePool>) -> Result<impl Responder, ApiError> {
+    let (sessions, _current_date, _total_points) = fetch_sessions(&pool).await?;
+    let (_, _, overall_streak, yearly_streak, monthly_streak) =
+        calculate_statistics(&sessions, Default::default())?;
 
     Ok(HttpResponse::Ok().json(StreaksResponse {
         overall_streak,
@@ -349,8 +344,8 @@ async fn get_streaks(db: web::Data<Arc<Db>>) -> Result<impl Responder, ApiError>
     }))
 }
 
-async fn get_streak_bonuses(db: web::Data<Arc<Db>>) -> Result<impl Responder, ApiError> {
-    let (sessions, _current_date, _total_points) = fetch_sessions(&db)?;
+async fn get_streak_bonuses(pool: web::Data<sqlx::SqlitePool>) -> Result<impl Responder, ApiError> {
+    let (sessions, _current_date, _total_points) = fetch_sessions(&pool).await?;
     let bonuses = calculate_weekly_streak_bonus(&sessions);
 
     Ok(HttpResponse::Ok().json(bonuses))
@@ -409,15 +404,17 @@ fn calculate_weekly_streak_bonus(sessions: &[Session]) -> Vec<StreakBonusRespons
     }
 }
 
-async fn get_overall_statistics(db: web::Data<Arc<Db>>) -> Result<impl Responder, ApiError> {
-    let (sessions, current_date, total_points) = fetch_sessions(&db)?;
+async fn get_overall_statistics(
+    pool: web::Data<sqlx::SqlitePool>,
+) -> Result<impl Responder, ApiError> {
+    let (sessions, current_date, total_points) = fetch_sessions(&pool).await?;
     let (weekly_trend, achievements, overall_streak, yearly_streak, monthly_streak) =
-        calculate_statistics(&sessions)?;
+        calculate_statistics(&sessions, Default::default())?;
 
     Ok(HttpResponse::Ok().json(StatisticsResponse {
-        current_date, // Use the current_date from fetch_sessions
+        current_date,
         streak: overall_streak,
-        total_points, // Already calculated total_points
+        total_points,
         weekly_trend,
         achievements,
         yearly_streak,
@@ -427,95 +424,184 @@ async fn get_overall_statistics(db: web::Data<Arc<Db>>) -> Result<impl Responder
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    dotenv().ok(); // Load environment variables
+    dotenv().ok(); // Ensure this line is present
 
-    // Initialize the Sled embedded database
-    let db = Arc::new(sled::open("my_db").expect("Failed to open sled database"));
+    let database_url = "sqlite::memory:";
+
+    // Print the database URL for debugging purposes
+    println!("Using database URL: {}", database_url);
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .expect("Failed to create pool.");
+
+    // Initialize the database
+    init_db(&pool)
+        .await
+        .expect("Failed to initialize database.");
+
+    // Share the pool across routes
+    let pool = web::Data::new(pool);
 
     HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::new(db.clone())) // Share sled db across routes
-            .route("/api/time", web::get().to(get_time)) // Fetch current time and streaks
-            .route("/api/log_session", web::post().to(create_session)) // Log a new session
+            .app_data(pool.clone())
+            .route("/", web::get().to(api_docs)) // Add the documentation endpoint
+            .route("/api/time", web::get().to(get_time))
+            .route("/api/log_session", web::post().to(create_session))
             .route(
                 "/api/statistics/weekly_trend",
                 web::get().to(get_weekly_trend),
-            ) // Fetch weekly trends
+            )
             .route(
                 "/api/statistics/achievements",
                 web::get().to(get_achievements),
-            ) // Fetch achievements
-            .route("/api/statistics/streaks", web::get().to(get_streaks)) // Fetch streak details
+            )
+            .route("/api/statistics/streaks", web::get().to(get_streaks))
             .route(
                 "/api/statistics/overall",
                 web::get().to(get_overall_statistics),
-            ) // Fetch overall statistics
-            .route("/api/bonuses/streaks", web::get().to(get_streak_bonuses)) // Fetch streak bonuses
+            )
+            .route("/api/bonuses/streaks", web::get().to(get_streak_bonuses))
     })
         .bind("127.0.0.1:8080")?
         .run()
         .await
 }
 
-/// tests
+async fn init_db(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS session (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            session_type TEXT NOT NULL
+        );
+        "#,
+    )
+        .execute(pool)
+        .await?;
 
-#[cfg(test)]
-fn sample_sessions() -> Vec<Session> {
-    vec![
-        Session {
-            date: "2023-10-01".to_string(),
-            session_type: "1-hour".to_string(),
-        },
-        Session {
-            date: "2023-10-02".to_string(),
-            session_type: "2-hours".to_string(),
-        },
-        Session {
-            date: "2023-10-03".to_string(),
-            session_type: "3-hours".to_string(),
-        },
-    ]
+    Ok(())
 }
 
+/// Generate an API documentation page
+async fn api_docs() -> impl Responder {
+    let doc_content = r#"
+        <html>
+        <head>
+            <title>API Documentation</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                h1 { color: #333; }
+                table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+                th { background-color: #f2f2f2; }
+                pre { background-color: #f8f8f8; padding: 10px; }
+            </style>
+        </head>
+        <body>
+            <h1>API Documentation</h1>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Endpoint</th>
+                        <th>Method</th>
+                        <th>Description</th>
+                        <th>Request Example</th>
+                        <th>Response Example</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>/api/time</td>
+                        <td>GET</td>
+                        <td>Fetch the current time and calculate streaks.</td>
+                        <td>N/A</td>
+                        <td><pre>{ "current_time": "2023-10-01T00:00:00Z", "streak": 3, "total_points": 36, "date": "2023-10-01" }</pre></td>
+                    </tr>
+                    <tr>
+                        <td>/api/log_session</td>
+                        <td>POST</td>
+                        <td>Create a new session log entry.</td>
+                        <td><pre>{ "date": "2023-10-01", "session_type": "1-hour" }</pre></td>
+                        <td><pre>{ "current_time": "2023-10-01T00:00:00Z", "streak": 3, "total_points": 36, "date": "2023-10-01" }</pre></td>
+                    </tr>
+                    <tr>
+                        <td>/api/statistics/weekly_trend</td>
+                        <td>GET</td>
+                        <td>Retrieve weekly trends for sessions.</td>
+                        <td>N/A</td>
+                        <td><pre>[{ "week_start": "2023-09-25", "points": 36 }]</pre></td>
+                    </tr>
+                    <tr>
+                        <td>/api/statistics/achievements</td>
+                        <td>GET</td>
+                        <td>Fetch user achievements.</td>
+                        <td>N/A</td>
+                        <td><pre>{ "achievements": [] }</pre></td>
+                    </tr>
+                    <tr>
+                        <td>/api/statistics/streaks</td>
+                        <td>GET</td>
+                        <td>Fetch overall, yearly, and monthly streaks.</td>
+                        <td>N/A</td>
+                        <td><pre>{ "overall_streak": 3, "yearly_streak": 3, "monthly_streak": 3 }</pre></td>
+                    </tr>
+                    <tr>
+                        <td>/api/statistics/overall</td>
+                        <td>GET</td>
+                        <td>Retrieve overall statistics.</td>
+                        <td>N/A</td>
+                        <td><pre>{ "current_date": "2023-10-01", "streak": 3, "total_points": 36, "weekly_trend": [], "achievements": [], "yearly_streak": 3, "monthly_streak": 3 }</pre></td>
+                    </tr>
+                    <tr>
+                        <td>/api/bonuses/streaks</td>
+                        <td>GET</td>
+                        <td>Get streak bonuses for the current week.</td>
+                        <td>N/A</td>
+                        <td><pre>[{ "streak_length": 3, "week_start": "2023-09-25" }]</pre></td>
+                    </tr>
+                </tbody>
+            </table>
+        </body>
+        </html>
+    "#;
+
+    HttpResponse::Ok()
+        .content_type("text/html")
+        .body(doc_content)
+}
+// Tests
 #[cfg(test)]
 mod tests {
     use super::*;
     use actix_web::test;
+    use chrono::NaiveDate;
 
-    // Update the existing test for calculating streak and points
-    #[test]
-    async fn test_calculate_streak_and_points() {
-        let sessions = sample_sessions();
-        let (streak, total_points) = calculate_streak_and_points(&sessions).unwrap();
-        assert_eq!(streak, 3);
-        assert_eq!(total_points, 36); // 10 + 12 + 14
+    // Sample sessions for testing
+    fn sample_sessions() -> Vec<Session> {
+        vec![
+            Session {
+                id: 1,
+                date: "2023-10-01".to_string(),
+                session_type: "1-hour".to_string(),
+            },
+            Session {
+                id: 2,
+                date: "2023-10-02".to_string(),
+                session_type: "2-hours".to_string(),
+            },
+            Session {
+                id: 3,
+                date: "2023-10-03".to_string(),
+                session_type: "3-hours".to_string(),
+            },
+        ]
     }
 
-    // Test for calculate_statistics function with updates for bonuses and streaks
-    #[test]
-    async fn test_calculate_statistics() {
-        let sessions = sample_sessions();
-
-        // Calculate statistics with the function from the code
-        let (weekly_trend, achievements, overall_streak, yearly_streak, monthly_streak) =
-            calculate_statistics(&sessions).unwrap();
-
-        // Ensure the weekly trends are correctly calculated
-        assert_eq!(weekly_trend.len(), 1); // One weekly trend entry
-        assert_eq!(weekly_trend[0].points, 36); // Points for the week
-
-        // Check achievements (since there's no 7-day streak in this example)
-        assert!(achievements.is_empty());
-
-        // Check the overall streak
-        assert_eq!(overall_streak, 3); // Expect a streak of 3
-
-        // Check yearly and monthly streaks
-        assert_eq!(yearly_streak, 3); // Expect a streak of 3
-        assert_eq!(monthly_streak, 3); // Expect a streak of 3
-    }
-
-    // Tests for parsing valid and invalid dates
     #[test]
     async fn test_parse_date_valid() {
         let date = parse_date("2023-10-01").unwrap();
@@ -527,14 +613,25 @@ mod tests {
         let result = parse_date("invalid-date");
         assert!(result.is_err());
     }
-}
-
-#[cfg(test)]
-mod weekly_points_tests {
-    use super::*;
 
     #[test]
-    fn test_calculate_weekly_streak_bonuses() {
+    async fn test_calculate_session_points() {
+        assert_eq!(calculate_session_points("1-hour"), 10);
+        assert_eq!(calculate_session_points("2-hours"), 12);
+        assert_eq!(calculate_session_points("3-hours"), 14);
+        assert_eq!(calculate_session_points("invalid"), 0);
+    }
+
+    #[test]
+    async fn test_calculate_streak_and_points() {
+        let sessions = sample_sessions();
+        let (streak, total_points) = calculate_streak_and_points(&sessions).unwrap();
+        assert_eq!(streak, 3);
+        assert_eq!(total_points, 36); // 10 + 12 + 14
+    }
+
+    #[test]
+    async fn test_calculate_weekly_streak_bonus() {
         let sessions = sample_sessions();
 
         let weekly_streak_bonuses = calculate_weekly_streak_bonus(&sessions);
@@ -548,68 +645,119 @@ mod weekly_points_tests {
         // Check the week start date
         assert_eq!(weekly_streak_bonuses[0].week_start, "2023-10-02");
     }
-}
-
-#[cfg(test)]
-mod streaks_and_bonus_tests {
-    use super::*;
 
     #[test]
-    fn test_calculate_streaks_and_bonus_points() {
+    async fn test_calculate_statistics() {
+        // Set the mock date to October 15, 2023
+        let current_date = NaiveDate::from_ymd_opt(2023, 10, 15).unwrap();
+
         let sessions = sample_sessions();
-        let (streak, total_points) = calculate_streak_and_points(&sessions).unwrap();
-        assert_eq!(streak, 3);
-        assert_eq!(total_points, 36); // 10 + 12 + 14
-    }
-}
 
-#[cfg(test)]
-mod integration_tests {
-    use super::*;
-    use actix_web::{test, App};
+        let (weekly_trend, achievements, overall_streak, yearly_streak, monthly_streak) =
+            calculate_statistics(&sessions, current_date).unwrap();
 
-    #[actix_rt::test]
-    async fn test_get_time_endpoint() {
-        let _ = std::fs::remove_dir_all("test_db"); // Remove the existing test database before starting the test
-        let db = Arc::new(sled::open("test_db").expect("Failed to open sled database"));
+        // Ensure the weekly trends are correctly calculated
+        assert_eq!(weekly_trend.len(), 2);
+        assert_eq!(weekly_trend[0].points, 10);
+        assert_eq!(weekly_trend[1].points, 26);
 
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(db.clone()))
-                .route("/api/time", web::get().to(get_time)),
-        )
-            .await;
+        // Check achievements (since there's no 7-day streak in this example)
+        assert!(achievements.is_empty());
 
-        let req = test::TestRequest::get().uri("/api/time").to_request();
-        let resp: TimeResponse = test::call_and_read_body_json(&app, req).await;
+        // Check the overall streak
+        assert_eq!(overall_streak, 3); // Expect a streak of 3
 
-        assert!(!resp.current_time.is_empty());
+        // Check yearly and monthly streaks
+        assert_eq!(yearly_streak, 3); // Expect a yearly streak of 3
+        assert_eq!(monthly_streak, 3); // Expect a monthly streak of 3
     }
 
-    #[actix_rt::test]
-    async fn test_get_streak_bonuses_endpoint() {
-        let _ = std::fs::remove_dir_all("test_db"); // Clean up the test database
-        let db = Arc::new(sled::open("test_db").expect("Failed to open sled database"));
+    // Integration tests
+    mod integration_tests {
+        use super::*;
+        use actix_web::{test, App};
 
-        // Add some sample data to the database
-        let sample_data = sample_sessions();
-        for session in sample_data {
-            db.insert(session.date.clone(), serde_json::to_vec(&session).unwrap())
-                .expect("Failed to insert sample data");
+        #[actix_rt::test]
+        async fn test_get_time_endpoint() {
+            // Set up an in-memory SQLite database for testing
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .connect(":memory:")
+                .await
+                .unwrap();
+
+            init_db(&pool).await.unwrap();
+
+            // Insert sample sessions into the test database
+            let sample_sessions = vec![
+                SessionLog {
+                    date: "2023-10-01".to_string(),
+                    session_type: "1-hour".to_string(),
+                },
+                SessionLog {
+                    date: "2023-10-02".to_string(),
+                    session_type: "2-hours".to_string(),
+                },
+            ];
+
+            for session in sample_sessions {
+                sqlx::query("INSERT INTO session (date, session_type) VALUES (?, ?)")
+                    .bind(&session.date)
+                    .bind(&session.session_type)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(pool.clone()))
+                    .route("/api/time", web::get().to(get_time)),
+            )
+                .await;
+
+            let req = test::TestRequest::get().uri("/api/time").to_request();
+            let resp: TimeResponse = test::call_and_read_body_json(&app, req).await;
+
+            // Assert to confirm streak calculation works correctly
+            assert_eq!(resp.streak, 2); // Expecting a streak of 2 from the inserted sessions
+            assert_eq!(resp.total_points, 22); // 10 + 12 points
         }
 
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(db.clone()))
-                .route("/api/bonuses/streaks", web::get().to(get_streak_bonuses)),
-        )
-            .await;
+        #[actix_rt::test]
+        async fn test_get_streak_bonuses_endpoint() {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .connect(":memory:")
+                .await
+                .unwrap();
 
-        let req = test::TestRequest::get().uri("/api/bonuses/streaks").to_request();
-        let resp: Vec<StreakBonusResponse> = test::call_and_read_body_json(&app, req).await;
+            init_db(&pool).await.unwrap();
 
-        assert_eq!(resp.len(), 1);
-        assert_eq!(resp[0].streak_length, 3);
-        assert_eq!(resp[0].week_start, "2023-09-25");
+            // Add sample data to the database
+            let sample_data = sample_sessions();
+            for session in sample_data {
+                sqlx::query("INSERT INTO session (date, session_type) VALUES (?, ?)")
+                    .bind(&session.date)
+                    .bind(&session.session_type)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(pool.clone()))
+                    .route("/api/bonuses/streaks", web::get().to(get_streak_bonuses)),
+            )
+                .await;
+
+            let req = test::TestRequest::get()
+                .uri("/api/bonuses/streaks")
+                .to_request();
+            let resp: Vec<StreakBonusResponse> = test::call_and_read_body_json(&app, req).await;
+
+            assert_eq!(resp.len(), 1);
+            assert_eq!(resp[0].streak_length, 3);
+            assert_eq!(resp[0].week_start, "2023-10-02");
+        }
     }
 }
