@@ -5,9 +5,6 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-log = "0.4.22"
-env_logger = "0.11.5"
-futures = "0.3"
 actix-web = "4"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros"] }
 dotenv = "0.15"
@@ -16,9 +13,8 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 itertools = "0.13.0"
 
-
 [dev-dependencies]
-actix-rt = "2"        # This is required for running async tests
-backend = { path = "../backend" }
+actix-rt = "2"
 mock_instant = "0.5.1"
 mockall = "0.13.0"
+

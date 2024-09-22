@@ -216,7 +216,7 @@ fn calculate_streak_and_points(sessions: &[Session]) -> Result<(usize, usize), A
     // Fold function to calculate streak and points
     let fold_fn = |(streak, total_points, last_date): (usize, usize, Option<NaiveDate>),
                    session: &Session|
-                   -> Result<(usize, usize, Option<NaiveDate>), ApiError> {
+     -> Result<(usize, usize, Option<NaiveDate>), ApiError> {
         let current_date = parse_date(&session.date)?;
         let session_points = calculate_session_points(&session.session_type);
         let new_streak = update_streak(last_date, current_date, streak);
@@ -433,7 +433,7 @@ async fn main() -> std::io::Result<()> {
 
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&database_url)
+        .connect(database_url)
         .await
         .expect("Failed to create pool.");
 
@@ -466,9 +466,9 @@ async fn main() -> std::io::Result<()> {
             )
             .route("/api/bonuses/streaks", web::get().to(get_streak_bonuses))
     })
-        .bind("127.0.0.1:8080")?
-        .run()
-        .await
+    .bind("127.0.0.1:8080")?
+    .run()
+    .await
 }
 
 async fn init_db(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
@@ -481,8 +481,8 @@ async fn init_db(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
         );
         "#,
     )
-        .execute(pool)
-        .await?;
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
@@ -516,49 +516,49 @@ async fn api_docs() -> impl Responder {
                 </thead>
                 <tbody>
                     <tr>
-                        <td>/api/time</td>
+                        <td><a href="/api/time">/api/time</a></td>
                         <td>GET</td>
                         <td>Fetch the current time and calculate streaks.</td>
                         <td>N/A</td>
                         <td><pre>{ "current_time": "2023-10-01T00:00:00Z", "streak": 3, "total_points": 36, "date": "2023-10-01" }</pre></td>
                     </tr>
                     <tr>
-                        <td>/api/log_session</td>
+                        <td><a href="/api/log_session">/api/log_session</a></td>
                         <td>POST</td>
                         <td>Create a new session log entry.</td>
                         <td><pre>{ "date": "2023-10-01", "session_type": "1-hour" }</pre></td>
                         <td><pre>{ "current_time": "2023-10-01T00:00:00Z", "streak": 3, "total_points": 36, "date": "2023-10-01" }</pre></td>
                     </tr>
                     <tr>
-                        <td>/api/statistics/weekly_trend</td>
+                        <td><a href="/api/statistics/weekly_trend">/api/statistics/weekly_trend</a></td>
                         <td>GET</td>
                         <td>Retrieve weekly trends for sessions.</td>
                         <td>N/A</td>
                         <td><pre>[{ "week_start": "2023-09-25", "points": 36 }]</pre></td>
                     </tr>
                     <tr>
-                        <td>/api/statistics/achievements</td>
+                        <td><a href="/api/statistics/achievements">/api/statistics/achievements</a></td>
                         <td>GET</td>
                         <td>Fetch user achievements.</td>
                         <td>N/A</td>
                         <td><pre>{ "achievements": [] }</pre></td>
                     </tr>
                     <tr>
-                        <td>/api/statistics/streaks</td>
+                        <td><a href="/api/statistics/streaks">/api/statistics/streaks</a></td>
                         <td>GET</td>
                         <td>Fetch overall, yearly, and monthly streaks.</td>
                         <td>N/A</td>
                         <td><pre>{ "overall_streak": 3, "yearly_streak": 3, "monthly_streak": 3 }</pre></td>
                     </tr>
                     <tr>
-                        <td>/api/statistics/overall</td>
+                        <td><a href="/api/statistics/overall">/api/statistics/overall</a></td>
                         <td>GET</td>
                         <td>Retrieve overall statistics.</td>
                         <td>N/A</td>
                         <td><pre>{ "current_date": "2023-10-01", "streak": 3, "total_points": 36, "weekly_trend": [], "achievements": [], "yearly_streak": 3, "monthly_streak": 3 }</pre></td>
                     </tr>
                     <tr>
-                        <td>/api/bonuses/streaks</td>
+                        <td><a href="/api/bonuses/streaks">/api/bonuses/streaks</a></td>
                         <td>GET</td>
                         <td>Get streak bonuses for the current week.</td>
                         <td>N/A</td>
@@ -713,7 +713,7 @@ mod tests {
                     .app_data(web::Data::new(pool.clone()))
                     .route("/api/time", web::get().to(get_time)),
             )
-                .await;
+            .await;
 
             let req = test::TestRequest::get().uri("/api/time").to_request();
             let resp: TimeResponse = test::call_and_read_body_json(&app, req).await;
@@ -748,7 +748,7 @@ mod tests {
                     .app_data(web::Data::new(pool.clone()))
                     .route("/api/bonuses/streaks", web::get().to(get_streak_bonuses)),
             )
-                .await;
+            .await;
 
             let req = test::TestRequest::get()
                 .uri("/api/bonuses/streaks")
